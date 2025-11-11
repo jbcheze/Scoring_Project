@@ -294,3 +294,112 @@ def prepare_chimerge_auto(df: pd.DataFrame, var: str, q: int = 10, target: str =
             counts = counts.drop(max_bin_idx).reset_index(drop=True)
 
     return counts
+
+
+######################################
+######################################
+######################################
+
+def chimerge_categorical(df: pd.DataFrame, var: str, target: str = "loan_status",
+                         max_bins: int = 5, min_pct: float = 0.05, verbose: bool = True):
+    """
+    Version améliorée du ChiMerge pour variables catégorielles.
+    Regroupe les modalités selon leur taux de défaut tout en respectant :
+    - un nombre maximum de groupes (max_bins)
+    - un effectif minimal par groupe (min_pct)
+    - une stabilité du risque (pas de groupes avec < 5 % du total)
+    """
+
+    total_obs = len(df)
+
+    # 1️⃣ Calcul du taux de défaut et tri des modalités
+    stats = (
+        df.groupby(var)[target]
+        .agg(["count", "sum"])
+        .rename(columns={"count": "total", "sum": "bad"})
+        .assign(good=lambda d: d["total"] - d["bad"])
+    ).reset_index()
+
+    stats["bad_rate"] = stats["bad"] / stats["total"]
+    stats = stats.sort_values("bad_rate").reset_index(drop=True)
+    stats["group"] = stats[var]
+
+    # 2️⃣ Boucle de fusion ChiMerge (catégoriel)
+    while len(stats) > max_bins:
+        chi_values = []
+        for i in range(len(stats) - 1):
+            table = np.array([
+                [stats.loc[i, "good"], stats.loc[i, "bad"]],
+                [stats.loc[i + 1, "good"], stats.loc[i + 1, "bad"]]
+            ])
+            chi2, p, _, _ = chi2_contingency(table)
+            chi_values.append((p, i))
+
+        # Trouver la paire la plus proche
+        p_max, idx = max(chi_values, key=lambda x: x[0])
+
+        # Fusionner les deux modalités les plus proches
+        stats.loc[idx, "group"] = f"{stats.loc[idx, 'group']}_{stats.loc[idx + 1, 'group']}"
+        stats.loc[idx, "good"] += stats.loc[idx + 1, "good"]
+        stats.loc[idx, "bad"] += stats.loc[idx + 1, "bad"]
+        stats.loc[idx, "total"] += stats.loc[idx + 1, "total"]
+        stats = stats.drop(idx + 1).reset_index(drop=True)
+
+    # 3️⃣ Regroupement final
+    regroupement = {}
+    for _, row in stats.iterrows():
+        for cat in row["group"].split("_"):
+            regroupement[cat] = row["group"]
+
+    df[f"{var}_bin"] = df[var].map(regroupement)
+
+    # 4️⃣ Vérification des contraintes
+    summary = (
+        df.groupby(f"{var}_bin")[target]
+        .agg(["mean", "count"])
+        .rename(columns={"mean": "taux_defaut", "count": "effectif"})
+        .reset_index()
+    )
+    summary["pct_total"] = summary["effectif"] / total_obs
+
+    # Condition : ≥ 5% d’effectif par groupe
+    small_groups = summary[summary["pct_total"] < min_pct]
+
+    if not small_groups.empty:
+        if verbose:
+            print(f"\n⚠️ Fusion de groupes trop petits (< {min_pct*100:.1f}% des observations)")
+        # Fusionner le plus petit avec le plus proche en taux de défaut
+        while (summary["pct_total"] < min_pct).any() and len(summary) > 1:
+            small_idx = summary["pct_total"].idxmin()
+            if small_idx == 0:
+                merge_with = 1
+            else:
+                prev_diff = abs(summary.loc[small_idx, "taux_defaut"] - summary.loc[small_idx - 1, "taux_defaut"])
+                next_diff = abs(summary.loc[small_idx, "taux_defaut"] - summary.loc[small_idx + 1, "taux_defaut"]) if small_idx + 1 < len(summary) else np.inf
+                merge_with = small_idx - 1 if prev_diff <= next_diff else small_idx + 1
+
+            g1, g2 = summary.loc[[small_idx, merge_with], f"{var}_bin"].tolist()
+            new_group = f"{g1}_{g2}"
+
+            # Mise à jour du regroupement
+            for k, v in regroupement.items():
+                if v in [g1, g2]:
+                    regroupement[k] = new_group
+
+            # Appliquer au DataFrame
+            df[f"{var}_bin"] = df[var].map(regroupement)
+
+            # Recalcul du summary
+            summary = (
+                df.groupby(f"{var}_bin")[target]
+                .agg(["mean", "count"])
+                .rename(columns={"mean": "taux_defaut", "count": "effectif"})
+                .reset_index()
+            )
+            summary["pct_total"] = summary["effectif"] / total_obs
+
+    if verbose:
+        print(f"\n✅ Regroupement final pour {var} :")
+        print(summary[["effectif", "pct_total", "taux_defaut"]])
+
+    return regroupement, df
