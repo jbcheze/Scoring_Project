@@ -537,17 +537,24 @@ def apply_binning(df: pd.DataFrame, var: str, intervals: pd.DataFrame) -> pd.Dat
 # ----------------------------------------------------------------------
 # 4️⃣ ChiMerge catégoriel amélioré
 # ----------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import chi2_contingency
+
 def chimerge_categorical(df: pd.DataFrame, var: str, target: str = "loan_status",
-                         max_bins: int = 5, min_pct: float = 0.05, verbose: bool = True):
+                         max_bins: int = 5, min_pct: float = 0.05,
+                         verbose: bool = True, enforce_monotonicity: bool = True):
     """
-    Version améliorée du ChiMerge pour variables catégorielles :
-    - max 5 modalités
-    - chaque modalité ≥ 5 % du total
-    - stabilité monotone du risque
+    ChiMerge amélioré :
+    - Fusionne les modalités selon Chi2
+    - Imposant une monotonie stricte du taux de défaut
+    - Affiche les graphes avant/après
     """
     total_obs = len(df)
 
-    # Calcul initial
+    # === 1️⃣ Calcul de base
     stats = (
         df.groupby(var)[target]
         .agg(["count", "sum"])
@@ -559,7 +566,7 @@ def chimerge_categorical(df: pd.DataFrame, var: str, target: str = "loan_status"
     stats = stats.sort_values("bad_rate").reset_index(drop=True)
     stats["group"] = stats[var]
 
-    # --- Fusion ChiMerge ---
+    # === 2️⃣ Fusion ChiMerge
     while len(stats) > max_bins:
         chi_values = []
         for i in range(len(stats) - 1):
@@ -575,7 +582,7 @@ def chimerge_categorical(df: pd.DataFrame, var: str, target: str = "loan_status"
         stats = stats.drop(idx+1).reset_index(drop=True)
         stats["bad_rate"] = stats["bad"] / stats["total"]
 
-    # --- Fusion bins trop petits ---
+    # === 3️⃣ Fusion bins trop petits
     changed = True
     while changed:
         changed = False
@@ -590,45 +597,80 @@ def chimerge_categorical(df: pd.DataFrame, var: str, target: str = "loan_status"
             stats["bad_rate"] = stats["bad"] / stats["total"]
             changed = True
 
-    # --- Correction de la monotonie ---
-    if len(stats) > 2:
-        changed = True
-        while changed:
-            changed = False
-            direction = np.sign(stats["bad_rate"].iloc[-1] - stats["bad_rate"].iloc[0])
-            for i in range(len(stats) - 1):
-                if direction > 0 and stats.loc[i+1, "bad_rate"] < stats.loc[i, "bad_rate"]:
-                    stats.loc[i, "group"] += "_" + stats.loc[i+1, "group"]
-                    stats.loc[i, ["good", "bad", "total"]] += stats.loc[i+1, ["good", "bad", "total"]]
-                    stats = stats.drop(i+1).reset_index(drop=True)
-                    stats["bad_rate"] = stats["bad"] / stats["total"]
-                    changed = True
-                    break
-                elif direction < 0 and stats.loc[i+1, "bad_rate"] > stats.loc[i, "bad_rate"]:
-                    stats.loc[i, "group"] += "_" + stats.loc[i+1, "group"]
-                    stats.loc[i, ["good", "bad", "total"]] += stats.loc[i+1, ["good", "bad", "total"]]
-                    stats = stats.drop(i+1).reset_index(drop=True)
-                    stats["bad_rate"] = stats["bad"] / stats["total"]
-                    changed = True
-                    break
+    # === 4️⃣ Correction stricte de la monotonie ===
+    if enforce_monotonicity:
+        direction = np.sign(stats["bad_rate"].iloc[-1] - stats["bad_rate"].iloc[0])
 
-    # --- Mapping final ---
+        def is_monotone(arr, direction):
+            return np.all(np.diff(arr) >= 0) if direction >= 0 else np.all(np.diff(arr) <= 0)
+
+        while not is_monotone(stats["bad_rate"].values, direction) and len(stats) > 1:
+            # Trouver la première inversion
+            bad_rate = stats["bad_rate"].values
+            if direction >= 0:
+                inv_idx = np.where(np.diff(bad_rate) < 0)[0]
+            else:
+                inv_idx = np.where(np.diff(bad_rate) > 0)[0]
+            if len(inv_idx) == 0:
+                break
+            i = inv_idx[0]
+            # Fusionner le bin fautif avec le suivant
+            stats.loc[i, "group"] += "_" + stats.loc[i+1, "group"]
+            stats.loc[i, ["good", "bad", "total"]] += stats.loc[i+1, ["good", "bad", "total"]]
+            stats = stats.drop(i+1).reset_index(drop=True)
+            stats["bad_rate"] = stats["bad"] / stats["total"]
+
+    # === 5️⃣ Attribution des noms bin1, bin2...
+    stats = stats.sort_values("bad_rate").reset_index(drop=True)
+    stats["bin_name"] = [f"bin{i+1}" for i in range(len(stats))]
+
     regroupement = {}
     for _, row in stats.iterrows():
         for cat in row["group"].split("_"):
-            regroupement[cat] = row["group"]
+            regroupement[cat] = row["bin_name"]
 
     df[f"{var}_bin"] = df[var].map(regroupement)
 
+    # === 6️⃣ Graphiques
+    plt.figure(figsize=(8, 5))
+    sns.countplot(data=df, x=var, order=df[var].value_counts().index, palette="viridis")
+    plt.title(f"Répartition de {var} avant discrétisation")
+    plt.xlabel(var)
+    plt.ylabel("Effectif")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 5))
+    sns.countplot(data=df, x=f"{var}_bin", order=sorted(df[f"{var}_bin"].unique()), palette="mako")
+    plt.title(f"Répartition de {var} après discrétisation (ChiMerge monotone)")
+    plt.xlabel(f"{var}_bin")
+    plt.ylabel("Effectif")
+    plt.tight_layout()
+    plt.show()
+
+    # === 7️⃣ Courbe du taux de défaut par bin
+    summary = (
+        df.groupby(f"{var}_bin")[target]
+        .agg(["mean", "count"])
+        .rename(columns={"mean": "taux_defaut", "count": "effectif"})
+        .reset_index()
+    )
+    plt.figure(figsize=(7, 4))
+    sns.lineplot(data=summary, x=f"{var}_bin", y="taux_defaut", marker="o")
+    plt.title(f"Taux de défaut par bin ({var}) – Vérification de la monotonie")
+    plt.xlabel(f"{var}_bin")
+    plt.ylabel("Taux de défaut moyen")
+    plt.tight_layout()
+    plt.show()
+
+    # === 8️⃣ Affichage final
     if verbose:
-        summary = (
-            df.groupby(f"{var}_bin")[target]
-            .agg(["mean", "count"])
-            .rename(columns={"mean": "taux_defaut", "count": "effectif"})
-            .reset_index()
-        )
         summary["pct_total"] = summary["effectif"] / total_obs
-        print(f"\n✅ Regroupement final stable et monotone pour {var} :")
+        print(f"\n✅ Regroupement final monotone pour {var} :")
         print(summary)
+        print("\n📊 Détails des regroupements :")
+        for old_cat, new_bin in regroupement.items():
+            print(f" - {old_cat} → {new_bin}")
 
     return regroupement, df
